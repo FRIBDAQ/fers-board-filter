@@ -1,0 +1,3 @@
+*.o
+/fersBoardFilter
+/test_router
