@@ -77,7 +77,7 @@ struct BoardRouter::View {
 BoardRouter::BoardRouter(uint32_t activeBoards, Timestamp mode)
   : m_active(activeBoards & ((1u << kMaxBoards) - 1)),
     m_mode(mode),
-    m_dataFormat(34)
+    m_dataFormat(0)
 {
 }
 
@@ -94,7 +94,9 @@ BoardRouter::route(const void* pItem, size_t nBytes)
     return out;
   }
 
-  if (v.type != PHYSICS_EVENT) return broadcast(p, nBytes, v);
+  // State changes and anything else Janus might add: every board, with the
+  // timestamp NSCLDAQ readouts give barrier items
+  if (v.type != PHYSICS_EVENT) return broadcast(p, nBytes, v, &kNullTimestamp);
 
   // After inclusiveSize an event carries the metadata word, the file-header
   // record the dataformat major and minor bytes.  The low byte of the
@@ -106,8 +108,15 @@ BoardRouter::route(const void* pItem, size_t nBytes)
   }
   uint16_t word2 = get16(v.body + 2);
   if ((word2 & 0xff) > 1) {
+    // One copy per run, in the lowest active board's ring.  Its timestamp
+    // (0 from Janus) is kept: glom then builds it alone, or with trigger 0
+    // in trigger mode; an unpacker walking the fragments tells it apart by
+    // the same byte.
     m_dataFormat = (word2 & 0xff)*10 + (word2 >> 8);
-    return broadcast(p, nBytes, v);
+    m_stats.headerRecords++;
+    int lowest = __builtin_ctz(m_active);
+    out.push_back({lowest, rewrite(p, nBytes, v, lowest, nullptr)});
+    return out;
   }
 
   if (v.bodySize < 7) {
@@ -134,6 +143,11 @@ BoardRouter::route(const void* pItem, size_t nBytes)
     int acqmode = (word2 >> 8) & 0x0f;
     if (acqmode == kAcqModeTiming) {
       once("timing-mode events carry no trigger_id; keeping the Janus timestamps");
+    } else if (acqmode == kAcqModeSpecTiming && m_dataFormat == 0) {
+      // Whether DeltaTref precedes trigger_id depends on the data format,
+      // which only the run's header record tells
+      once("no Janus header record seen yet (started mid-run?): keeping the Janus "
+           "timestamps of spectiming events until the next run starts");
     } else {
       // inclusiveSize(2) metadata(2) eventSize(2) board_id(1) tstamp_us(8)
       size_t offset = 15;
@@ -155,11 +169,12 @@ BoardRouter::route(const void* pItem, size_t nBytes)
 }
 
 std::vector<BoardRouter::Output>
-BoardRouter::broadcast(const uint8_t* p, size_t n, const View& v)
+BoardRouter::broadcast(const uint8_t* p, size_t n, const View& v,
+                       const uint64_t* pTimestamp)
 {
   std::vector<Output> out;
   for (unsigned b = 0; b < kMaxBoards; b++) {
-    if (m_active & (1u << b)) out.push_back({static_cast<int>(b), rewrite(p, n, v, b, nullptr)});
+    if (m_active & (1u << b)) out.push_back({static_cast<int>(b), rewrite(p, n, v, b, pTimestamp)});
   }
   m_stats.broadcast++;
   return out;

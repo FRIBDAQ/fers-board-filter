@@ -19,9 +19,14 @@
 //
 // Reads the ring Janus writes to and copies every board's PHYSICS_EVENT
 // items into the ring INRING_<board> with the body-header source id set to
-// the board number; BEGIN/END_RUN and the Janus file-header record go to
-// every board ring.  The event builder (ReadoutCallouts.tcl) then takes
-// each INRING_<board> as one data source.
+// the board number; BEGIN/END_RUN go to every board ring, the Janus
+// file-header record to the lowest active board's ring.  The event builder
+// (ReadoutCallouts.tcl) then takes each INRING_<board> as one data source.
+//
+// Messages go to stderr in the ReadoutGUI Actions protocol
+// ("LOGMSG <length> <text>", see NSCLDAQ Actions.cpp), so that the
+// FERSBoardFilter Tcl package can show them in the ReadoutGUI log; read on
+// a terminal they are still plain text.
 
 #include "BoardRouter.h"
 
@@ -38,12 +43,24 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
 using namespace std;
 
 static const char* kProgram = "fersBoardFilter";
+
+// One Actions packet; directive is LOGMSG, WRNMSG or ERRMSG.  Messages must
+// not contain newlines.
+static void
+say(const char* directive, const string& msg)
+{
+  cerr << directive << " " << msg.size() << " " << msg << "\n" << flush;
+}
+static void logMsg(const string& m)  { say("LOGMSG", m); }
+static void warnMsg(const string& m) { say("WRNMSG", m); }
+static void errMsg(const string& m)  { say("ERRMSG", m); }
 
 static void
 usage(ostream& o)
@@ -59,19 +76,24 @@ usage(ostream& o)
        "                       builds by trigger number; not possible in timing mode)\n"
        "  --help\n"
        "Each active board b gets the output ring <name>_<b> on this host, where <name>\n"
-       "is the ring part of INRING; it is created when it does not exist.\n";
+       "is the ring part of INRING; it is created when it does not exist.  A local\n"
+       "INRING that does not exist yet is created too, so the filter can be started\n"
+       "before Janus.\n";
 }
 
-static void
-report(const BoardRouter& router, ostream& o)
+static string
+report(const BoardRouter& router)
 {
   const BoardRouter::Stats& s = router.stats();
-  o << kProgram << ": events";
+  ostringstream o;
+  o << "events";
   for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
     if (router.activeBoards() & (1u << b)) o << " board" << b << "=" << s.perBoard[b];
   }
-  o << "; to all boards " << s.broadcast << "; dropped masked " << s.maskedDropped
-    << ", bad " << s.badDropped << "; dataformat " << router.dataFormat() << endl;
+  o << "; to all boards " << s.broadcast << "; header records " << s.headerRecords
+    << "; dropped masked " << s.maskedDropped << ", bad " << s.badDropped
+    << "; dataformat " << router.dataFormat();
+  return o.str();
 }
 
 int
@@ -89,7 +111,7 @@ main(int argc, char** argv)
       case 't':
         if (!strcmp(optarg, "keep"))         mode = BoardRouter::Timestamp::Keep;
         else if (!strcmp(optarg, "trigger")) mode = BoardRouter::Timestamp::Trigger;
-        else { cerr << kProgram << ": --timestamp must be keep or trigger\n"; return 2; }
+        else { errMsg("--timestamp must be keep or trigger"); return 2; }
         break;
       case 'h': usage(cout); return 0;
       default:  usage(cerr); return 2;
@@ -101,21 +123,29 @@ main(int argc, char** argv)
   char* end = nullptr;
   unsigned long mask = strtoul(argv[optind + 1], &end, 0);
   if (*argv[optind + 1] == '\0' || *end != '\0') {
-    cerr << kProgram << ": MASK must be a number (e.g. 0x3)\n"; return 2;
+    errMsg("MASK must be a number (e.g. 0x3)"); return 2;
   }
   uint32_t active = mask & ((1u << BoardRouter::kMaxBoards) - 1);
-  if (active == 0) { cerr << kProgram << ": MASK keeps no board\n"; return 2; }
+  if (active == 0) { errMsg("MASK keeps no board"); return 2; }
   if (mask != active) {
-    cerr << kProgram << ": only boards 0-" << BoardRouter::kMaxBoards - 1
-         << " exist; ignoring the upper bits of the mask\n";
+    warnMsg("only boards 0-" + to_string(BoardRouter::kMaxBoards - 1)
+            + " exist; ignoring the upper bits of the mask");
   }
 
   // A bare name is a ring on this host; the output rings take its name
-  string uri = source.find("://") == string::npos ? "tcp://localhost/" + source : source;
+  bool local = source.find("://") == string::npos;
+  string uri = local ? "tcp://localhost/" + source : source;
   string name = uri.substr(uri.rfind('/') + 1);
-  if (name.empty()) { cerr << kProgram << ": cannot derive a ring name from " << uri << "\n"; return 2; }
+  if (name.empty()) { errMsg("cannot derive a ring name from " + uri); return 2; }
 
   try {
+    // Janus only creates its ring at the start of a run; make it so that
+    // the filter can be started first (Janus then attaches as producer)
+    if (local && !CRingBuffer::isRing(name)) {
+      CRingBuffer::create(name);
+      logMsg("created ring " + name);
+    }
+
     map<int, unique_ptr<CRingBuffer>> rings;
     for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
       if (!(active & (1u << b))) continue;
@@ -124,17 +154,21 @@ main(int argc, char** argv)
         rings[b].reset(new CRingBuffer(ringName, CRingBuffer::producer));
       } else {
         rings[b].reset(CRingBuffer::createAndProduce(ringName));
-        cerr << kProgram << ": created ring " << ringName << endl;
+        logMsg("created ring " + ringName);
       }
     }
 
     unique_ptr<CDataSource> src(CDataSourceFactory::makeSource(uri, {}, {}));
     BoardRouter router(active, mode);
-    cerr << kProgram << ": reading " << uri << ", boards";
-    for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
-      if (active & (1u << b)) cerr << " " << b << " -> " << name << "_" << b;
+    {
+      ostringstream o;
+      o << "reading " << uri << ", boards";
+      for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
+        if (active & (1u << b)) o << " " << b << " -> " << name << "_" << b;
+      }
+      o << "; timestamps " << (mode == BoardRouter::Timestamp::Keep ? "kept" : "trigger_id");
+      logMsg(o.str());
     }
-    cerr << endl;
 
     while (true) {
       unique_ptr<CRingItem> item(src->getItem());
@@ -143,14 +177,14 @@ main(int argc, char** argv)
       for (auto& out : router.route(item->getItemPointer(), item->size())) {
         rings[out.board]->put(out.item.data(), out.item.size());
       }
-      for (auto& msg : router.takeMessages()) cerr << kProgram << ": " << msg << endl;
-      if (item->type() == END_RUN) report(router, cerr);
+      for (auto& msg : router.takeMessages()) warnMsg(msg);
+      if (item->type() == END_RUN) logMsg("end of run: " + report(router));
     }
-    report(router, cerr);
+    logMsg("end of input: " + report(router));
   }
-  catch (CException& e) { cerr << kProgram << ": " << e.ReasonText() << endl; return 1; }
-  catch (exception& e)  { cerr << kProgram << ": " << e.what() << endl; return 1; }
-  catch (string& e)     { cerr << kProgram << ": " << e << endl; return 1; }
-  catch (const char* e) { cerr << kProgram << ": " << e << endl; return 1; }
+  catch (CException& e) { errMsg(e.ReasonText()); return 1; }
+  catch (exception& e)  { errMsg(e.what()); return 1; }
+  catch (string& e)     { errMsg(e); return 1; }
+  catch (const char* e) { errMsg(e); return 1; }
   return 0;
 }

@@ -8,6 +8,7 @@
 #include "BoardRouter.h"
 
 #include <DataFormat.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -144,18 +145,30 @@ int main(int argc, char** argv)
   // --- routing with the Janus timestamps kept, boards 0 and 1 active
   {
     BoardRouter r(0x3, BoardRouter::Timestamp::Keep);
+    CHECK(r.dataFormat() == 0);
     size_t n[8] = {}; size_t bcast = 0;
     for (auto& item : stream) {
       auto outs = r.route(item.data(), item.size());
       uint32_t type = get<uint32_t>(item, 4);
-      if (type != PHYSICS_EVENT || item.size() == 8 + 20 + 32) {   // state change or header record
+      if (type != PHYSICS_EVENT) {                        // state change: every board, NULL_TIMESTAMP
         CHECK(outs.size() == 2);
         bcast++;
         for (auto& o : outs) {
           CHECK(o.board == 0 || o.board == 1);
           CHECK(get<uint32_t>(o.item, SID) == uint32_t(o.board));
-          CHECK(sameButHeader(o.item, item, false));
+          CHECK(get<uint64_t>(o.item, TS) == UINT64_MAX);
+          CHECK(get<uint32_t>(o.item, SID + 4) == (type == BEGIN_RUN ? 1u : 2u));   // barrier kept
+          CHECK(sameButHeader(o.item, item, true));
         }
+      } else if (item.size() == 8 + 20 + 32) {            // header record: lowest board only, stamp kept
+        CHECK(outs.size() == 1);
+        if (outs.size() == 1) {
+          CHECK(outs[0].board == 0);
+          CHECK(get<uint32_t>(outs[0].item, SID) == 0);
+          CHECK(get<uint64_t>(outs[0].item, TS) == 0);
+          CHECK(sameButHeader(outs[0].item, item, false));
+        }
+        CHECK(r.dataFormat() == 34);
       } else {
         uint8_t board = item[8 + 20 + 6];
         if (board == 2) { CHECK(outs.empty()); continue; }
@@ -167,9 +180,10 @@ int main(int argc, char** argv)
       }
     }
     CHECK(n[0] == 5 && n[1] == 5);
-    CHECK(bcast == 3);
+    CHECK(bcast == 2);
     CHECK(r.stats().perBoard[0] == 5 && r.stats().perBoard[1] == 5 && r.stats().perBoard[2] == 0);
-    CHECK(r.stats().broadcast == 3);
+    CHECK(r.stats().broadcast == 2);
+    CHECK(r.stats().headerRecords == 1);
     CHECK(r.stats().maskedDropped == 5);
     CHECK(r.stats().badDropped == 0);
     CHECK(r.dataFormat() == 34);
@@ -178,9 +192,32 @@ int main(int argc, char** argv)
     CHECK(r.takeMessages().empty());
   }
 
+  // --- the header record goes to the lowest *active* board
+  {
+    BoardRouter r(0x6, BoardRouter::Timestamp::Keep);
+    Bytes hdr = headerItem(0x01);
+    auto outs = r.route(hdr.data(), hdr.size());
+    CHECK(outs.size() == 1 && outs[0].board == 1 && get<uint32_t>(outs[0].item, SID) == 1);
+  }
+
   // --- trigger_id as timestamp, in every record layout
   {
     BoardRouter r(0xff, BoardRouter::Timestamp::Trigger);
+    // spectiming before any header record: the DeltaTref question is open,
+    // so the Janus stamp is kept and said once
+    {
+      Ev e; e.acqmode = 0x03; e.deltaTref = true; e.board = 2; e.tstamp_us = 5.0; e.trigger = 7;
+      Bytes item = eventItem(e);
+      auto outs = r.route(item.data(), item.size());
+      CHECK(outs.size() == 1 && get<uint64_t>(outs[0].item, TS) == 50000);
+      auto msgs = r.takeMessages();
+      CHECK(msgs.size() == 1 && msgs[0].find("no Janus header record") != string::npos);
+      // spect events do not depend on the format: trigger used right away
+      Ev s; s.board = 2; s.trigger = 8;
+      Bytes sitem = eventItem(s);
+      outs = r.route(sitem.data(), sitem.size());
+      CHECK(outs.size() == 1 && get<uint64_t>(outs[0].item, TS) == 8);
+    }
     Bytes hdr = headerItem(0x03); r.route(hdr.data(), hdr.size());
     struct { Ev e; const char* what; } cases[] = {
       {Ev(), "spect"},
@@ -269,8 +306,8 @@ int main(int argc, char** argv)
 
   // --- bad input is dropped, not propagated
   {
-    BoardRouter r(0xff, BoardRouter::Timestamp::Keep);
-    Ev e; e.board = 9; Bytes big = eventItem(e);
+    BoardRouter r(0xffff, BoardRouter::Timestamp::Keep);
+    Ev e; e.board = 20; Bytes big = eventItem(e);
     CHECK(r.route(big.data(), big.size()).empty());
     Bytes trunc(big.begin(), big.begin() + 30);               // size field disagrees
     CHECK(r.route(trunc.data(), trunc.size()).empty());

@@ -29,8 +29,11 @@
 // board and trigger, all with the same body-header source id; here each
 // item is copied to its board's output with the source id set to the board
 // number so that the NSCLDAQ event builder can treat every board as its
-// own data source.  Everything that is not a board event (BEGIN/END_RUN,
-// the Janus file-header record, ...) is copied to every board's output.
+// own data source.  BEGIN/END_RUN and other non-event items are copied to
+// every board's output with NULL_TIMESTAMP, the NSCLDAQ convention for
+// barrier items (Janus stamps them with wall-clock seconds).  The Janus
+// file-header record written once per run goes to the lowest active
+// board's output only, so a run has one copy of it.
 //
 // Works on raw ring item bytes (DataFormat.h) so it can be tested without
 // the NSCLDAQ libraries.
@@ -47,7 +50,7 @@
 class BoardRouter
 {
   public:
-    static const unsigned kMaxBoards = 8;   // FERS_MAX_BOARDS (SpecTcl-Janus)
+    static const unsigned kMaxBoards = 16;  // FERSlib limit (SpecTcl-Janus handles 8)
 
     // Keep: the body-header timestamp Janus assigned (tstamp_us * 10000).
     // Trigger: replace it with the event's trigger_id so that the event
@@ -62,6 +65,7 @@ class BoardRouter
     struct Stats {
       uint64_t perBoard[kMaxBoards] = {};  // board events forwarded
       uint64_t broadcast = 0;              // items copied to every board
+      uint64_t headerRecords = 0;          // Janus file-header records
       uint64_t maskedDropped = 0;          // events of masked-out boards
       uint64_t badDropped = 0;             // malformed or board_id >= kMaxBoards
     };
@@ -76,7 +80,8 @@ class BoardRouter
 
     const Stats& stats() const { return m_stats; }
     uint32_t activeBoards() const { return m_active; }
-    // major*10 + minor of the last file-header record seen (34 = Janus 5.0.1)
+    // major*10 + minor of the last file-header record seen (33 = Janus
+    // 4.2.0, 34 = Janus 5.0.1); 0 until one has been seen
     int dataFormat() const { return m_dataFormat; }
 
     // Warnings not reported before; the caller prints them.
@@ -84,7 +89,8 @@ class BoardRouter
 
   private:
     struct View;
-    std::vector<Output> broadcast(const uint8_t* p, size_t n, const View& v);
+    std::vector<Output> broadcast(const uint8_t* p, size_t n, const View& v,
+                                  const uint64_t* pTimestamp);
     std::vector<uint8_t> rewrite(const uint8_t* p, size_t n, const View& v,
                                  uint32_t sourceId, const uint64_t* pTimestamp);
     void once(const std::string& msg);
