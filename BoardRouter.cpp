@@ -108,14 +108,17 @@ BoardRouter::route(const void* pItem, size_t nBytes)
   }
   uint16_t word2 = get16(v.body + 2);
   if ((word2 & 0xff) > 1) {
-    // One copy per run, in the lowest active board's ring.  Its timestamp
-    // (0 from Janus) is kept: glom then builds it alone, or with trigger 0
-    // in trigger mode; an unpacker walking the fragments tells it apart by
-    // the same byte.
+    // One copy per active board, each with its board's source id and the
+    // Janus timestamp (0) kept, so every source has a fragment at 0 and glom
+    // builds the copies together (with trigger 0 in trigger mode).  A single
+    // copy in one ring left the orderer waiting for the other sources until
+    // its timeout.  An unpacker walking the fragments tells the record apart
+    // by the same byte.
     m_dataFormat = (word2 & 0xff)*10 + (word2 >> 8);
     m_stats.headerRecords++;
-    int lowest = __builtin_ctz(m_active);
-    out.push_back({lowest, rewrite(p, nBytes, v, lowest, nullptr)});
+    for (unsigned b = 0; b < kMaxBoards; b++) {
+      if (m_active & (1u << b)) out.push_back({static_cast<int>(b), rewrite(p, nBytes, v, b, nullptr)});
+    }
     return out;
   }
 

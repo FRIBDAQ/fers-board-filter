@@ -32,8 +32,9 @@
 // own data source.  BEGIN/END_RUN and other non-event items are copied to
 // every board's output with NULL_TIMESTAMP, the NSCLDAQ convention for
 // barrier items (Janus stamps them with wall-clock seconds).  The Janus
-// file-header record written once per run goes to the lowest active
-// board's output only, so a run has one copy of it.
+// file-header record written once per run is copied to every board's
+// output with its timestamp (0) kept, so that every event-builder source
+// has a fragment at that timestamp.
 //
 // Works on raw ring item bytes (DataFormat.h) so it can be tested without
 // the NSCLDAQ libraries.

@@ -13,8 +13,10 @@ from one board, then several from the other) rather than board by board.
 * copies BEGIN/END_RUN (and any other non-event item) to every board ring,
   source id per ring and timestamp `NULL_TIMESTAMP`, as NSCLDAQ readouts stamp
   barrier items (Janus puts wall-clock seconds there);
-* puts the Janus file-header record, written once per run, into the lowest
-  active board's ring only, so a run has one copy of it;
+* copies the Janus file-header record, written once per run, to every board
+  ring with the source id per ring and its timestamp 0 kept, so every
+  event-builder source has a fragment at 0 (a single copy in one ring left
+  the orderer waiting for the other sources until its timeout);
 * creates the output rings – and a local input ring – when they do not exist,
   so it can be started before Janus;
 * drops events of boards that are not in the mask (one notice per board) and
@@ -23,8 +25,9 @@ from one board, then several from the other) rather than board by board.
 The event builder set up in `ReadoutCallouts.tcl` then takes each
 `<inring>_<board>` as one data source and writes built events to
 `<inring>_event`.  SpecTcl no longer needs the `boardMask` merging: every built
-event already holds one fragment per active board (plus, once per run, the
-header record – in trigger mode it shares the built event of trigger 0).
+event already holds one fragment per active board (plus, once per run, one
+built event holding a copy of the header record per board – in trigger mode
+it is the built event of trigger 0).
 
 ## Files
 

@@ -160,13 +160,13 @@ int main(int argc, char** argv)
           CHECK(get<uint32_t>(o.item, SID + 4) == (type == BEGIN_RUN ? 1u : 2u));   // barrier kept
           CHECK(sameButHeader(o.item, item, true));
         }
-      } else if (item.size() == 8 + 20 + 32) {            // header record: lowest board only, stamp kept
-        CHECK(outs.size() == 1);
-        if (outs.size() == 1) {
-          CHECK(outs[0].board == 0);
-          CHECK(get<uint32_t>(outs[0].item, SID) == 0);
-          CHECK(get<uint64_t>(outs[0].item, TS) == 0);
-          CHECK(sameButHeader(outs[0].item, item, false));
+      } else if (item.size() == 8 + 20 + 32) {            // header record: every board, stamp kept
+        CHECK(outs.size() == 2);
+        for (size_t i = 0; i < outs.size(); i++) {
+          CHECK(outs[i].board == int(i));
+          CHECK(get<uint32_t>(outs[i].item, SID) == i);
+          CHECK(get<uint64_t>(outs[i].item, TS) == 0);
+          CHECK(sameButHeader(outs[i].item, item, false));
         }
         CHECK(r.dataFormat() == 34);
       } else {
@@ -192,12 +192,17 @@ int main(int argc, char** argv)
     CHECK(r.takeMessages().empty());
   }
 
-  // --- the header record goes to the lowest *active* board
+  // --- the header record goes to every *active* board, and only to them
   {
     BoardRouter r(0x6, BoardRouter::Timestamp::Keep);
     Bytes hdr = headerItem(0x01);
     auto outs = r.route(hdr.data(), hdr.size());
-    CHECK(outs.size() == 1 && outs[0].board == 1 && get<uint32_t>(outs[0].item, SID) == 1);
+    CHECK(outs.size() == 2);
+    if (outs.size() == 2) {
+      CHECK(outs[0].board == 1 && get<uint32_t>(outs[0].item, SID) == 1);
+      CHECK(outs[1].board == 2 && get<uint32_t>(outs[1].item, SID) == 2);
+    }
+    CHECK(r.stats().headerRecords == 1 && r.stats().broadcast == 0);
   }
 
   // --- trigger_id as timestamp, in every record layout
