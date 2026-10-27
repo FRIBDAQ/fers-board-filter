@@ -116,7 +116,8 @@ namespace eval FERSBoardFilter {
     # Private
 
     ##
-    # Start the filter if it is not running, then wait for its rings
+    # Start the filter if it is not running, then wait until it produces
+    # into every output ring
     proc start {} {
         variable here
         variable pipe
@@ -132,7 +133,7 @@ namespace eval FERSBoardFilter {
             }
 
             foreach ring [outrings] {
-                killOldProducer $ring
+                freeProducer $ring
             }
 
             set pipe [open "| $cmd --timestamp=$timestamp $inring $boardMask |& cat" r]
@@ -142,14 +143,19 @@ namespace eval FERSBoardFilter {
                 "Started $cmd --timestamp=$timestamp $inring $boardMask (pid [pid $pipe])"
         }
 
-        # Also when already running: the rings must be there before the
-        # event builder's ring sources start
-        waitForRings
+        # Also when already running: the event builder's ring sources need
+        # the rings, and a filter that could not attach (or has died) must
+        # stop the run start here instead of leaving the event builder
+        # without data
+        waitForProducer [lindex [pid $pipe] 0]
     }
 
     ##
-    # Pipe readable: hand the output to the Actions parser; on EOF forget
-    # the pipe so that the next run start launches the filter again.
+    # Pipe readable: hand the output to the Actions parser.  On EOF (all
+    # output is parsed by then) close the pipe here rather than in the
+    # parser, which pops up a dialog, so that the exit status can be
+    # logged, and forget it so that the next run start launches the filter
+    # again.
     proc onReadable {} {
         variable pipe
         variable parser
@@ -158,44 +164,96 @@ namespace eval FERSBoardFilter {
             return
         }
         set fd $pipe
-        if {[eof $fd]} {
-            set pipe {}
-            ReadoutGUIPanel::Log FERSBoardFilter error \
-                "fersBoardFilter exited; it will be started again at the next run start"
+        if {![eof $fd]} {
+            $parser onReadable $fd
+            return
         }
-        $parser onReadable $fd
-    }
-
-    ##
-    # Kill the producer of an output ring left behind by an earlier session
-    proc killOldProducer {ring} {
-        if {$ring in [ringbuffer list]} {
-            set producerPid [lindex [ringbuffer usage $ring] 3]
-            if {$producerPid != -1} {
-                ReadoutGUIPanel::Log FERSBoardFilter log \
-                    "Killing the old producer of $ring (pid $producerPid)"
-                catch {exec kill $producerPid}
+        set pipe {}
+        chan event $fd readable {}
+        chan configure $fd -blocking 1
+        set how exited
+        if {[catch {close $fd} msg opts]} {
+            set code [dict get $opts -errorcode]
+            switch [lindex $code 0] {
+                CHILDSTATUS { set how "exited with status [lindex $code 2]" }
+                CHILDKILLED { set how "was killed by [lindex $code 2]" }
+                default     { set how "exited ($msg)" }
             }
         }
+        ReadoutGUIPanel::Log FERSBoardFilter error \
+            "fersBoardFilter $how; it will be started again at the next run start"
     }
 
     ##
-    # Wait (up to 5 s) until every output ring exists
-    proc waitForRings {} {
+    # Producer pid of a ring; -1 when it has none or does not exist
+    proc producerOf {ring} {
+        if {[catch {lindex [ringbuffer usage $ring] 3} producerPid]} {
+            return -1
+        }
+        return $producerPid
+    }
+
+    ##
+    # True while process p runs (a zombie, i.e. an exited child not yet
+    # reaped, counts as gone)
+    proc isAlive {p} {
+        if {[catch {open /proc/$p/stat} fd]} {
+            return 0
+        }
+        set stat [read $fd]
+        close $fd
+        # The state follows the parenthesized command name
+        set state [string index [string trimleft [string range $stat [string last ")" $stat]+1 end]] 0]
+        return [expr {$state ne "Z"}]
+    }
+
+    ##
+    # Free the producer slot of an output ring left behind by an earlier
+    # session.  The RingMaster releases a dead producer's slot only once it
+    # notices the process is gone, and a filter started before that cannot
+    # attach ("already has a producer"); so wait (up to 5 s) for the
+    # release, and release the slot here once its process is dead.
+    proc freeProducer {ring} {
+        set producerPid [producerOf $ring]
+        if {$producerPid == -1} {
+            return
+        }
+        if {[isAlive $producerPid]} {
+            ReadoutGUIPanel::Log FERSBoardFilter log \
+                "Killing the old producer of $ring (pid $producerPid)"
+            catch {exec kill $producerPid}
+        }
+        for {set i 0} {$i < 50} {incr i} {
+            if {[producerOf $ring] == -1} {
+                return
+            }
+            if {![isAlive $producerPid]} {
+                catch {ringbuffer disconnect producer $ring}
+            }
+            after 100
+        }
+        error "FERSBoardFilter: the producer of $ring (pid $producerPid) does not go away"
+    }
+
+    ##
+    # Wait (up to 5 s) until the filter is the producer of every output ring
+    proc waitForProducer {filterPid} {
         for {set i 0} {$i < 50} {incr i} {
             set missing [list]
-            set rings [ringbuffer list]
             foreach ring [outrings] {
-                if {$ring ni $rings} {
+                if {[producerOf $ring] != $filterPid} {
                     lappend missing $ring
                 }
             }
             if {[llength $missing] == 0} {
                 return
             }
+            if {![isAlive $filterPid]} {
+                error "FERSBoardFilter: fersBoardFilter exited; its error is in the log"
+            }
             after 100
         }
-        error "FERSBoardFilter: ring(s) $missing were not created by fersBoardFilter"
+        error "FERSBoardFilter: fersBoardFilter (pid $filterPid) is not the producer of $missing"
     }
 
     namespace export attach enter leave
