@@ -15,20 +15,20 @@
           East Lansing, MI 48824-1321
 ******************************************************************************/
 
-// fersBoardFilter INRING MASK
+// fersBoardFilter [options] INRING MASK
 //
-// Reads the ring Janus writes to and copies every board's PHYSICS_EVENT
-// items into the ring INRING_<board> with the body-header source id set to
-// the board number; BEGIN/END_RUN go to every board ring, the Janus
-// file-header record to the lowest active board's ring.  The event builder
-// (ReadoutCallouts.tcl) then takes each INRING_<board> as one data source.
+// Reads the ring Janus writes to, builds the boards' PHYSICS_EVENT items of
+// a trigger into one built event (the layout glom writes, one fragment per
+// board with the source id set to the board number) and writes the built
+// events to the ring INRING_event; BEGIN/END_RUN pass through unchanged.
+// See EventBuilder.h for the building rules.
 //
 // Messages go to stderr in the ReadoutGUI Actions protocol
 // ("LOGMSG <length> <text>", see NSCLDAQ Actions.cpp), so that the
 // FERSBoardFilter Tcl package can show them in the ReadoutGUI log; read on
 // a terminal they are still plain text.
 
-#include "BoardRouter.h"
+#include "EventBuilder.h"
 
 #include <CDataSource.h>
 #include <CDataSourceFactory.h>
@@ -41,7 +41,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -65,54 +64,89 @@ static void errMsg(const string& m)  { say("ERRMSG", m); }
 static void
 usage(ostream& o)
 {
+  EventBuilder::Config d;
   o << "Usage: " << kProgram << " [options] INRING MASK\n"
        "  INRING  ring Janus writes to: a local ring name or a URL (tcp://host/name,\n"
        "          file:///path/run.evt)\n"
-       "  MASK    active boards, bit b set = board b kept (0x3: boards 0 and 1).\n"
+       "  MASK    active boards, bit b set = board b built (0x3: boards 0 and 1).\n"
        "          Note: the SpecTcl boardMask has the opposite sense.\n"
        "Options:\n"
-       "  --timestamp=keep     keep the Janus body-header timestamp (tstamp_us*10000) [default]\n"
-       "  --timestamp=trigger  use the event's trigger_id as timestamp (glom dt 0 then\n"
-       "                       builds by trigger number; not possible in timing mode)\n"
+       "  --key=time       the items of a trigger share the Janus timestamp within\n"
+       "                   --dt [default]\n"
+       "  --key=trigger    the items of a trigger share its trigger_id (only when the\n"
+       "                   boards count a common trigger; not possible in timing mode)\n"
+       "  --dt=N           time window, body-header timestamp units: 1 us = 10000\n"
+       "                   [" << d.dt << "]\n"
+       "  --max-pending=N  open triggers before the oldest is released although a\n"
+       "                   board has not gone past it [" << d.maxPending << "]\n"
+       "  --sourceid=N     body-header source id of the built events [" << d.sourceId << "]\n"
+       "  --outring=NAME   output ring on this host [<name>_event, <name> the ring part\n"
+       "                   of INRING]\n"
        "  --help\n"
-       "Each active board b gets the output ring <name>_<b> on this host, where <name>\n"
-       "is the ring part of INRING; it is created when it does not exist.  A local\n"
-       "INRING that does not exist yet is created too, so the filter can be started\n"
-       "before Janus.\n";
+       "The output ring is created when it does not exist.  A local INRING that does\n"
+       "not exist yet is created too, so the filter can be started before Janus.\n";
 }
 
 static string
-report(const BoardRouter& router)
+report(const EventBuilder& b)
 {
-  const BoardRouter::Stats& s = router.stats();
+  const EventBuilder::Stats& s = b.stats();
   ostringstream o;
-  o << "events";
-  for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
-    if (router.activeBoards() & (1u << b)) o << " board" << b << "=" << s.perBoard[b];
+  o << "built " << s.built << " events (" << s.incomplete << " missing a board, "
+    << s.forced << " forced, " << s.duplicates << " with a board twice); fragments";
+  for (unsigned i = 0; i < EventBuilder::kMaxBoards; i++) {
+    if (b.config().activeBoards & (1u << i)) o << " board" << i << "=" << s.perBoard[i];
   }
-  o << "; to all boards " << s.broadcast << "; header records " << s.headerRecords
+  o << "; header records " << s.headerRecords << "; passed through " << s.passed
     << "; dropped masked " << s.maskedDropped << ", bad " << s.badDropped
-    << "; dataformat " << router.dataFormat();
+    << "; dataformat " << b.dataFormat();
   return o.str();
+}
+
+static bool
+number(const char* s, unsigned long& v)
+{
+  char* end = nullptr;
+  v = strtoul(s, &end, 0);
+  return *s != '\0' && *end == '\0';
 }
 
 int
 main(int argc, char** argv)
 {
-  BoardRouter::Timestamp mode = BoardRouter::Timestamp::Keep;
+  EventBuilder::Config config;
+  string outring;
   static const option longopts[] = {
-    {"timestamp", required_argument, nullptr, 't'},
-    {"help",      no_argument,       nullptr, 'h'},
+    {"key",         required_argument, nullptr, 'k'},
+    {"dt",          required_argument, nullptr, 'd'},
+    {"max-pending", required_argument, nullptr, 'p'},
+    {"sourceid",    required_argument, nullptr, 's'},
+    {"outring",     required_argument, nullptr, 'o'},
+    {"help",        no_argument,       nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
   };
   int c;
-  while ((c = getopt_long(argc, argv, "t:h", longopts, nullptr)) != -1) {
+  unsigned long v;
+  while ((c = getopt_long(argc, argv, "k:d:p:s:o:h", longopts, nullptr)) != -1) {
     switch (c) {
-      case 't':
-        if (!strcmp(optarg, "keep"))         mode = BoardRouter::Timestamp::Keep;
-        else if (!strcmp(optarg, "trigger")) mode = BoardRouter::Timestamp::Trigger;
-        else { errMsg("--timestamp must be keep or trigger"); return 2; }
+      case 'k':
+        if (!strcmp(optarg, "time"))         config.key = EventBuilder::Key::Time;
+        else if (!strcmp(optarg, "trigger")) config.key = EventBuilder::Key::Trigger;
+        else { errMsg("--key must be time or trigger"); return 2; }
         break;
+      case 'd':
+        if (!number(optarg, v)) { errMsg("--dt must be a number"); return 2; }
+        config.dt = v;
+        break;
+      case 'p':
+        if (!number(optarg, v) || v == 0) { errMsg("--max-pending must be a number > 0"); return 2; }
+        config.maxPending = v;
+        break;
+      case 's':
+        if (!number(optarg, v)) { errMsg("--sourceid must be a number"); return 2; }
+        config.sourceId = v;
+        break;
+      case 'o': outring = optarg; break;
       case 'h': usage(cout); return 0;
       default:  usage(cerr); return 2;
     }
@@ -120,23 +154,23 @@ main(int argc, char** argv)
   if (argc - optind != 2) { usage(cerr); return 2; }
 
   string source = argv[optind];
-  char* end = nullptr;
-  unsigned long mask = strtoul(argv[optind + 1], &end, 0);
-  if (*argv[optind + 1] == '\0' || *end != '\0') {
+  unsigned long mask;
+  if (!number(argv[optind + 1], mask)) {
     errMsg("MASK must be a number (e.g. 0x3)"); return 2;
   }
-  uint32_t active = mask & ((1u << BoardRouter::kMaxBoards) - 1);
-  if (active == 0) { errMsg("MASK keeps no board"); return 2; }
-  if (mask != active) {
-    warnMsg("only boards 0-" + to_string(BoardRouter::kMaxBoards - 1)
+  config.activeBoards = mask & ((1u << EventBuilder::kMaxBoards) - 1);
+  if (config.activeBoards == 0) { errMsg("MASK keeps no board"); return 2; }
+  if (mask != config.activeBoards) {
+    warnMsg("only boards 0-" + to_string(EventBuilder::kMaxBoards - 1)
             + " exist; ignoring the upper bits of the mask");
   }
 
-  // A bare name is a ring on this host; the output rings take its name
+  // A bare name is a ring on this host; the output ring takes its name
   bool local = source.find("://") == string::npos;
   string uri = local ? "tcp://localhost/" + source : source;
   string name = uri.substr(uri.rfind('/') + 1);
   if (name.empty()) { errMsg("cannot derive a ring name from " + uri); return 2; }
+  if (outring.empty()) outring = name + "_event";
 
   try {
     // Janus only creates its ring at the start of a run; make it so that
@@ -146,27 +180,26 @@ main(int argc, char** argv)
       logMsg("created ring " + name);
     }
 
-    map<int, unique_ptr<CRingBuffer>> rings;
-    for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
-      if (!(active & (1u << b))) continue;
-      string ringName = name + "_" + to_string(b);
-      if (CRingBuffer::isRing(ringName)) {
-        rings[b].reset(new CRingBuffer(ringName, CRingBuffer::producer));
-      } else {
-        rings[b].reset(CRingBuffer::createAndProduce(ringName));
-        logMsg("created ring " + ringName);
-      }
+    unique_ptr<CRingBuffer> ring;
+    if (CRingBuffer::isRing(outring)) {
+      ring.reset(new CRingBuffer(outring, CRingBuffer::producer));
+    } else {
+      ring.reset(CRingBuffer::createAndProduce(outring));
+      logMsg("created ring " + outring);
     }
 
     unique_ptr<CDataSource> src(CDataSourceFactory::makeSource(uri, {}, {}));
-    BoardRouter router(active, mode);
+    EventBuilder builder(config);
     {
       ostringstream o;
-      o << "reading " << uri << ", boards";
-      for (unsigned b = 0; b < BoardRouter::kMaxBoards; b++) {
-        if (active & (1u << b)) o << " " << b << " -> " << name << "_" << b;
+      o << "reading " << uri << ", building boards";
+      for (unsigned b = 0; b < EventBuilder::kMaxBoards; b++) {
+        if (config.activeBoards & (1u << b)) o << " " << b;
       }
-      o << "; timestamps " << (mode == BoardRouter::Timestamp::Keep ? "kept" : "trigger_id");
+      o << " by " << (config.key == EventBuilder::Key::Time
+                      ? "timestamp, dt " + to_string(config.dt) : string("trigger_id"))
+        << " into " << outring << " (source id " << config.sourceId
+        << ", max " << config.maxPending << " open)";
       logMsg(o.str());
     }
 
@@ -174,13 +207,14 @@ main(int argc, char** argv)
       unique_ptr<CRingItem> item(src->getItem());
       if (!item) break;                     // end of a file source
 
-      for (auto& out : router.route(item->getItemPointer(), item->size())) {
-        rings[out.board]->put(out.item.data(), out.item.size());
+      for (auto& out : builder.process(item->getItemPointer(), item->size())) {
+        ring->put(out.data(), out.size());
       }
-      for (auto& msg : router.takeMessages()) warnMsg(msg);
-      if (item->type() == END_RUN) logMsg("end of run: " + report(router));
+      for (auto& msg : builder.takeMessages()) warnMsg(msg);
+      if (item->type() == END_RUN) logMsg("end of run: " + report(builder));
     }
-    logMsg("end of input: " + report(router));
+    for (auto& out : builder.flush()) ring->put(out.data(), out.size());
+    logMsg("end of input: " + report(builder));
   }
   catch (CException& e) { errMsg(e.ReasonText()); return 1; }
   catch (exception& e)  { errMsg(e.what()); return 1; }

@@ -1,3 +1,4 @@
 *.o
+*.evt
 /fersBoardFilter
-/test_router
+/test_builder

@@ -26,9 +26,9 @@
 # it is started with the settings of FERSBoardFilterSettings.tcl and its
 # output is parsed by the Actions package into the ReadoutGUI log.  The
 # filter keeps running between runs; if it exits it is restarted at the
-# next run start.  Before starting, a producer left on an output ring by
-# an earlier session is killed, and the start waits until every output
-# ring exists so that the event builder's ring sources find them.
+# next run start.  Before starting, a producer left on the output ring by
+# an earlier session is killed, and the run start waits until the filter
+# produces into the output ring ${inring}_event.
 
 lappend auto_path [file join $::env(DAQROOT) TclLibs]
 
@@ -49,7 +49,8 @@ namespace eval FERSBoardFilter {
     # Settings
     variable inring
     variable boardMask
-    variable timestamp
+    variable key
+    variable dt
     source [file join $here FERSBoardFilterSettings.tcl]
 
     set ::DefaultActions::name FERSBoardFilter
@@ -76,14 +77,10 @@ namespace eval FERSBoardFilter {
     }
 
     ##
-    # Output ring names, one per active board
-    proc outrings {} {
+    # Ring the built events go to
+    proc outring {} {
         variable inring
-        set result [list]
-        foreach b [boards] {
-            lappend result ${inring}_$b
-        }
-        return $result
+        return ${inring}_event
     }
 
     ##
@@ -124,7 +121,8 @@ namespace eval FERSBoardFilter {
         variable parser
         variable inring
         variable boardMask
-        variable timestamp
+        variable key
+        variable dt
 
         if {$pipe eq {}} {
             set cmd [file join $here fersBoardFilter]
@@ -132,21 +130,19 @@ namespace eval FERSBoardFilter {
                 error "FERSBoardFilter: $cmd is not built; run make in $here"
             }
 
-            foreach ring [outrings] {
-                freeProducer $ring
-            }
+            freeProducer [outring]
 
-            set pipe [open "| $cmd --timestamp=$timestamp $inring $boardMask |& cat" r]
+            set args "--key=$key --dt=$dt $inring $boardMask"
+            set pipe [open "| $cmd $args |& cat" r]
             chan configure $pipe -blocking 0 -buffering line
             chan event $pipe readable [list FERSBoardFilter::onReadable]
             ReadoutGUIPanel::Log FERSBoardFilter log \
-                "Started $cmd --timestamp=$timestamp $inring $boardMask (pid [pid $pipe])"
+                "Started $cmd $args (pid [pid $pipe])"
         }
 
-        # Also when already running: the event builder's ring sources need
-        # the rings, and a filter that could not attach (or has died) must
-        # stop the run start here instead of leaving the event builder
-        # without data
+        # Also when already running: a filter that could not attach (or has
+        # died) must stop the run start here instead of leaving the output
+        # ring without data
         waitForProducer [lindex [pid $pipe] 0]
     }
 
@@ -208,7 +204,7 @@ namespace eval FERSBoardFilter {
     }
 
     ##
-    # Free the producer slot of an output ring left behind by an earlier
+    # Free the producer slot of the output ring left behind by an earlier
     # session.  The RingMaster releases a dead producer's slot only once it
     # notices the process is gone, and a filter started before that cannot
     # attach ("already has a producer"); so wait (up to 5 s) for the
@@ -236,16 +232,10 @@ namespace eval FERSBoardFilter {
     }
 
     ##
-    # Wait (up to 5 s) until the filter is the producer of every output ring
+    # Wait (up to 5 s) until the filter is the producer of the output ring
     proc waitForProducer {filterPid} {
         for {set i 0} {$i < 50} {incr i} {
-            set missing [list]
-            foreach ring [outrings] {
-                if {[producerOf $ring] != $filterPid} {
-                    lappend missing $ring
-                }
-            }
-            if {[llength $missing] == 0} {
+            if {[producerOf [outring]] == $filterPid} {
                 return
             }
             if {![isAlive $filterPid]} {
@@ -253,7 +243,7 @@ namespace eval FERSBoardFilter {
             }
             after 100
         }
-        error "FERSBoardFilter: fersBoardFilter (pid $filterPid) is not the producer of $missing"
+        error "FERSBoardFilter: fersBoardFilter (pid $filterPid) is not the producer of [outring]"
     }
 
     namespace export attach enter leave

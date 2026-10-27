@@ -1,8 +1,11 @@
-# fersBoardFilter: split the Janus ring into one ring per FERS board.
-# Needs an NSCLDAQ 12 installation: source $DAQROOT/daqsetup.bash first.
+# fersBoardFilter: build the FERS boards' Janus ring items into one event per
+# trigger.  Needs an NSCLDAQ 12 installation: source $DAQROOT/daqsetup.bash
+# first.
 
+ifneq ($(MAKECMDGOALS),clean)
 ifndef DAQROOT
 $(error DAQROOT is not set; source the NSCLDAQ daqsetup.bash first)
+endif
 endif
 DAQINC ?= $(DAQROOT)/include
 DAQLIB ?= $(DAQROOT)/lib
@@ -14,19 +17,19 @@ LDLIBS    = -L$(DAQLIB) -Wl,-rpath=$(DAQLIB) \
 
 all: fersBoardFilter
 
-fersBoardFilter: fersBoardFilter.o BoardRouter.o
+fersBoardFilter: fersBoardFilter.o EventBuilder.o
 	$(CXX) -o $@ $^ $(LDLIBS)
 
-# The router test needs only DataFormat.h, not the NSCLDAQ libraries
-test: test_router
-	./test_router
+# The builder test needs only DataFormat.h, not the NSCLDAQ libraries
+test: test_builder
+	./test_builder
 
-test_router: test_router.o BoardRouter.o
+test_builder: test_builder.o EventBuilder.o
 	$(CXX) -o $@ $^
 
-fersBoardFilter.o BoardRouter.o test_router.o: BoardRouter.h
+fersBoardFilter.o EventBuilder.o test_builder.o: EventBuilder.h
 
 clean:
-	rm -f fersBoardFilter test_router *.o
+	rm -f fersBoardFilter test_builder *.o
 
 .PHONY: all test clean
