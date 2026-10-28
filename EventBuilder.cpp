@@ -122,6 +122,7 @@ EventBuilder::process(const void* pItem, size_t nBytes)
     m_seen = 0;
     if (v.type == BEGIN_RUN) m_stats = Stats();   // the counts are per run
     m_stats.passed++;
+    if (v.type == BEGIN_RUN) out.push_back(formatItem());   // each run's file starts with it
     out.emplace_back(p, p + nBytes);
     if (v.bodyHeader) {
       BodyHeader bh;

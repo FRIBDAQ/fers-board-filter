@@ -50,10 +50,10 @@
 //
 // BEGIN/END_RUN and any other non-event item pass through after the open
 // triggers are released, with the body-header source id set to sourceId
-// like everything else the builder writes.  Every BEGIN_RUN is followed by
-// an EVB_GLOM_INFO item describing the building (dt, timestamp policy), as
-// glom writes one; formatItem() gives the RING_FORMAT item
-// a stream starts with.  The Janus file-header record, written once per
+// like everything else the builder writes.  Every BEGIN_RUN is preceded by
+// a RING_FORMAT item, so that each run's event file starts with one, and
+// followed by an EVB_GLOM_INFO item describing the building (dt, timestamp
+// policy), as glom writes them.  The Janus file-header record, written once per
 // run, becomes a built event of its own with one fragment that keeps
 // Janus's source id.
 //
@@ -118,8 +118,8 @@ class EventBuilder
     // Releases every open trigger (end of input).
     Items flush();
 
-    // The RING_FORMAT item (FORMAT_MAJOR.FORMAT_MINOR of DataFormat.h) to
-    // write before anything else, as glom does when it starts.
+    // The RING_FORMAT item (FORMAT_MAJOR.FORMAT_MINOR of DataFormat.h)
+    // written before every BEGIN_RUN
     static std::vector<uint8_t> formatItem();
 
     const Stats& stats() const { return m_stats; }

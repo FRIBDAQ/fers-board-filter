@@ -24,9 +24,10 @@ rather than trigger by trigger.  `fersBoardFilter` reads that ring and
   the open triggers, with the body-header source id set to its own, and
   writes the Janus file-header record (once per run) as a built event with
   that one fragment;
-* starts its output with a `RING_FORMAT` item and follows every BEGIN_RUN
-  with an `EVB_GLOM_INFO` item (window `dt`, timestamp policy), as glom
-  does, so the stream looks like the event builder's to its consumers;
+* writes a `RING_FORMAT` item before every BEGIN_RUN, so each run's event
+  file starts with one, and an `EVB_GLOM_INFO` item (window `dt`, timestamp
+  policy) after it, as glom does, so the stream looks like the event
+  builder's to its consumers;
 * creates the output ring `<inring>_event` – and a local input ring – when
   they do not exist, so it can be started before Janus;
 * drops events of boards that are not in the mask (one notice per board) and
@@ -150,10 +151,11 @@ header of every item the filter writes carries `--sourceid`; only the
 fragments inside built events keep their own ids (the board number, or
 Janus's for the header record).
 
-The stream starts with a `RING_FORMAT` item (NSCLDAQ `FORMAT_MAJOR.MINOR`,
-no body header) and every BEGIN_RUN is followed by an `EVB_GLOM_INFO` item
-`{coincidenceTicks = dt (0 for --key=trigger), isBuilding 1, timestampPolicy
-= --timestamp}`; glom writes the same two items, the second once per process.
+Every BEGIN_RUN is preceded by a `RING_FORMAT` item (NSCLDAQ
+`FORMAT_MAJOR.MINOR`, no body header) and followed by an `EVB_GLOM_INFO`
+item `{coincidenceTicks = dt (0 for --key=trigger), isBuilding 1,
+timestampPolicy = --timestamp}`; glom writes the same two items once per
+process, which under ReadoutShell is once per run and file.
 
 ## Data layout the filter relies on
 

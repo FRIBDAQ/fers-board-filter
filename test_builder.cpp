@@ -210,33 +210,35 @@ int main(int argc, char** argv)
       out.insert(out.end(), outs.begin(), outs.end());
       if (i == 6) afterBoard0 = out.size();          // all of board 0 in, none of board 1
     }
-    CHECK(afterBoard0 == 3);                           // BEGIN_RUN, glom info and the header record only
+    CHECK(afterBoard0 == 4);                           // format, BEGIN_RUN, glom info, header record only
     CHECK(eb.open() == 0);
-    CHECK(out.size() == 3 + 5 + 1);
-    if (out.size() == 9) {
+    CHECK(out.size() == 4 + 5 + 1);
+    if (out.size() == 10) {
+      // the run's file starts with the format item
+      CHECK(out[0] == EventBuilder::formatItem());
       // BEGIN/END_RUN pass with the filter's source id, otherwise unchanged
-      CHECK(sameButSid(out[0], stream[0]) && get<uint32_t>(out[0], SID) == 100);
-      CHECK(sameButSid(out[8], stream.back()) && get<uint32_t>(out[8], SID) == 100);
+      CHECK(sameButSid(out[1], stream[0]) && get<uint32_t>(out[1], SID) == 100);
+      CHECK(sameButSid(out[9], stream.back()) && get<uint32_t>(out[9], SID) == 100);
       // after BEGIN_RUN the glom parameters: dt ticks, building, latest (the default)
-      CHECK(out[1].size() == sizeof(GlomParameters));
-      if (out[1].size() == sizeof(GlomParameters)) {
-        GlomParameters g; memcpy(&g, out[1].data(), sizeof g);
+      CHECK(out[2].size() == sizeof(GlomParameters));
+      if (out[2].size() == sizeof(GlomParameters)) {
+        GlomParameters g; memcpy(&g, out[2].data(), sizeof g);
         CHECK(g.s_header.s_size == sizeof g && g.s_header.s_type == EVB_GLOM_INFO);
         CHECK(g.s_empty == sizeof(uint32_t) && g.s_coincidenceTicks == eb.config().dt);
         CHECK(g.s_isBuilding == 1 && g.s_timestampPolicy == GLOM_TIMESTAMP_LAST);
       }
       // the header record: a built event of one fragment, payload source id kept
-      auto hf = fragments(out[2]);
+      auto hf = fragments(out[3]);
       CHECK(hf.size() == 1);
       if (hf.size() == 1) {
         CHECK(hf[0].item == stream[1]);
         CHECK(hf[0].sid == 7 && hf[0].ts == 0 && hf[0].barrier == 0);
       }
-      CHECK(get<uint64_t>(out[2], TS) == 0);
-      CHECK(get<uint32_t>(out[2], SID) == 100);
+      CHECK(get<uint64_t>(out[3], TS) == 0);
+      CHECK(get<uint32_t>(out[3], SID) == 100);
       CHECK(eb.dataFormat() == 34);
       for (int t = 0; t < 5; t++) {
-        const Bytes& e = out[3 + t];
+        const Bytes& e = out[4 + t];
         auto f = fragments(e);
         CHECK(f.size() == 2);
         if (f.size() != 2) continue;
@@ -258,7 +260,7 @@ int main(int argc, char** argv)
     // the counts start over with the next run
     size_t n = 0;
     for (auto& item : stream) n += eb.process(item.data(), item.size()).size();
-    CHECK(n == 9);                                    // the glom info again
+    CHECK(n == 10);                                   // format and glom info again
     CHECK(s.built == 5 && s.perBoard[0] == 5 && s.perBoard[1] == 5);
     CHECK(s.headerRecords == 1 && s.passed == 2 && s.maskedDropped == 5);
     CHECK(eb.takeMessages().empty());                  // still said once per process
@@ -420,7 +422,7 @@ int main(int argc, char** argv)
     EventBuilder eb(config(0x1));
     Bytes begin = stateItem(BEGIN_RUN, false);
     auto outs = eb.process(begin.data(), begin.size());
-    CHECK(outs.size() == 2 && outs[0] == begin);       // then the glom info
+    CHECK(outs.size() == 3 && outs[1] == begin);       // format, BEGIN_RUN, glom info
     Bytes bare = bareItem(PHYSICS_EVENT, Bytes(eventItem(Ev()).begin() + BODY, eventItem(Ev()).end()));
     CHECK(eb.process(bare.data(), bare.size()).empty());
     CHECK(eb.stats().badDropped == 1 && eb.stats().passed == 1);
@@ -488,9 +490,9 @@ int main(int argc, char** argv)
       EventBuilder eb(cfg);
       Bytes begin = stateItem(BEGIN_RUN, true);
       auto outs = eb.process(begin.data(), begin.size());
-      CHECK(outs.size() == 2);
-      if (outs.size() == 2) {
-        GlomParameters g; memcpy(&g, outs[1].data(), sizeof g);
+      CHECK(outs.size() == 3);
+      if (outs.size() == 3) {
+        GlomParameters g; memcpy(&g, outs[2].data(), sizeof g);
         CHECK(g.s_timestampPolicy == c.glom);
       }
       Ev e; e.board = 1; e.tstamp_us = 10.4; Bytes late = eventItem(e);
@@ -503,7 +505,7 @@ int main(int argc, char** argv)
     }
   }
 
-  // --- the RING_FORMAT item a stream starts with
+  // --- the RING_FORMAT item each run starts with
   {
     Bytes f = EventBuilder::formatItem();
     CHECK(f.size() == sizeof(DataFormat));

@@ -239,10 +239,6 @@ main(int argc, char** argv)
       logMsg(o.str());
     }
 
-    {
-      vector<uint8_t> format = EventBuilder::formatItem();
-      ring->put(format.data(), format.size());
-    }
     while (true) {
       unique_ptr<CRingItem> item(src->getItem());
       if (!item) break;                     // end of a file source
