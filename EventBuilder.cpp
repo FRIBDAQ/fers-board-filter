@@ -114,12 +114,22 @@ EventBuilder::process(const void* pItem, size_t nBytes)
   }
 
   // State changes and anything else Janus might add close the open
-  // triggers (a run boundary) and pass through unchanged
+  // triggers (a run boundary) and pass through as the filter's own
+  // items: the body-header source id becomes sourceId, like the built
+  // events' (an item without a body header is left alone)
   if (v.type != PHYSICS_EVENT) {
     releaseAll(out);
     m_seen = 0;
+    if (v.type == BEGIN_RUN) m_stats = Stats();   // the counts are per run
     m_stats.passed++;
     out.emplace_back(p, p + nBytes);
+    if (v.bodyHeader) {
+      BodyHeader bh;
+      std::memcpy(&bh, v.bodyHeader, sizeof bh);
+      bh.s_sourceId = m_config.sourceId;
+      std::memcpy(out.back().data() + (v.bodyHeader - p), &bh, sizeof bh);
+    }
+    if (v.type == BEGIN_RUN) out.push_back(glomItem());
     return out;
   }
 
@@ -134,8 +144,10 @@ EventBuilder::process(const void* pItem, size_t nBytes)
   uint16_t word2 = get16(v.body + 2);
   if ((word2 & 0xff) > 1) {
     // A built event of its own: the record is not a board's, so the
-    // fragment keeps the source id Janus gave it.  A new run starts here;
-    // its events may use another key than the previous run's.
+    // fragment keeps the source id Janus gave it; the wrapping body
+    // header carries sourceId like every item the builder writes.  A new
+    // run starts here; its events may use another key than the previous
+    // run's.
     releaseAll(out);
     m_seen = 0;
     m_dataFormat = (word2 & 0xff)*10 + (word2 >> 8);
@@ -244,6 +256,44 @@ EventBuilder::flush()
   return out;
 }
 
+std::vector<uint8_t>
+EventBuilder::formatItem()
+{
+  DataFormat f;
+  f.s_header.s_size = sizeof f;
+  f.s_header.s_type = RING_FORMAT;
+  f.s_empty         = sizeof(uint32_t);          // no body header
+  f.s_majorVersion  = FORMAT_MAJOR;
+  f.s_minorVersion  = FORMAT_MINOR;
+  std::vector<uint8_t> out;
+  append(out, f);
+  return out;
+}
+
+// What glom would report for this building: the window in timestamp ticks
+// (0 when grouping by trigger_id) and where the built event's timestamp
+// comes from
+std::vector<uint8_t>
+EventBuilder::glomItem() const
+{
+  uint16_t policy = GLOM_TIMESTAMP_LAST;
+  switch (m_config.timestamp) {
+    case Timestamp::First:   policy = GLOM_TIMESTAMP_FIRST;   break;
+    case Timestamp::Last:    policy = GLOM_TIMESTAMP_LAST;    break;
+    case Timestamp::Average: policy = GLOM_TIMESTAMP_AVERAGE; break;
+  }
+  GlomParameters g;
+  g.s_header.s_size    = sizeof g;
+  g.s_header.s_type    = EVB_GLOM_INFO;
+  g.s_empty            = sizeof(uint32_t);       // no body header
+  g.s_coincidenceTicks = m_dt;
+  g.s_isBuilding       = 1;
+  g.s_timestampPolicy  = policy;
+  std::vector<uint8_t> out;
+  append(out, g);
+  return out;
+}
+
 // Every active board has contributed or has sent a later key
 bool
 EventBuilder::complete(const Group& g) const
@@ -320,7 +370,6 @@ EventBuilder::addFragment(Group& g, const uint8_t* p, size_t n, const View& v,
   fh.s_size = out.size() - sizeof fh;
   std::memcpy(out.data(), &fh, sizeof fh);
 
-  if (timestamp != kNullTimestamp && timestamp < g.firstTs) g.firstTs = timestamp;
 }
 
 // The built event, as glom writes it: fragments in timestamp order (the
@@ -336,13 +385,31 @@ EventBuilder::finish(Group& g)
   size_t fragBytes = 0;
   for (auto& f : g.frags) fragBytes += f.bytes.size();
 
+  // The fragments are in timestamp order with the null ones (no body
+  // header) last; the event's timestamp comes from the others
+  uint64_t timestamp = kNullTimestamp;
+  size_t stamped = 0;
+  unsigned __int128 sum = 0;
+  for (auto& f : g.frags) {
+    if (f.timestamp == kNullTimestamp) break;
+    stamped++;
+    sum += f.timestamp;
+  }
+  if (stamped) {
+    switch (m_config.timestamp) {
+      case Timestamp::First:   timestamp = g.frags.front().timestamp;       break;
+      case Timestamp::Last:    timestamp = g.frags[stamped - 1].timestamp;  break;
+      case Timestamp::Average: timestamp = uint64_t(sum / stamped);         break;
+    }
+  }
+
   RingItemHeader h;
   BodyHeader bh;
   uint32_t bodyBytes = sizeof(uint32_t) + fragBytes;
   h.s_type = PHYSICS_EVENT;
   h.s_size = sizeof h + sizeof bh + bodyBytes;
   bh.s_size      = sizeof bh;
-  bh.s_timestamp = g.firstTs == UINT64_MAX ? kNullTimestamp : g.firstTs;
+  bh.s_timestamp = timestamp;
   bh.s_sourceId  = m_config.sourceId;
   bh.s_barrier   = 0;
 

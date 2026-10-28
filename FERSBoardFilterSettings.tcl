@@ -17,3 +17,10 @@ set key       time
 # Window for key time, in body-header timestamp units of the Janus build
 # (this Janus writes tstamp_us * 10; the glomdt used before).
 set dt        100
+
+# Body-header source id of everything the filter writes.
+set sourceId  10
+
+# Body-header timestamp of a built event: first, last or average of its
+# fragments' timestamps (glom's timestamp policy).
+set timestamp last

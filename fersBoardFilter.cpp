@@ -38,6 +38,7 @@
 #include <Exception.h>
 
 #include <getopt.h>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -79,7 +80,9 @@ usage(ostream& o)
        "                   [" << d.dt << "]\n"
        "  --max-pending=N  open triggers before the oldest is released although a\n"
        "                   board has not gone past it [" << d.maxPending << "]\n"
-       "  --sourceid=N     body-header source id of the built events [" << d.sourceId << "]\n"
+       "  --sourceid=N     body-header source id of all output items [" << d.sourceId << "]\n"
+       "  --timestamp=P    body-header timestamp of a built event: first, last or\n"
+       "                   average of its fragments' [last]\n"
        "  --outring=NAME   output ring on this host [<name>_event, <name> the ring part\n"
        "                   of INRING]\n"
        "  --help\n"
@@ -103,6 +106,30 @@ report(const EventBuilder& b)
   return o.str();
 }
 
+// "run N" and, when the item carries one, its title.  The body starts
+// with the run number in every NSCLDAQ version; the title follows the
+// 12.x s_originalSid or, in an 11.x body (4 bytes shorter), comes right
+// after s_offsetDivisor.
+static string
+runOf(const CRingItem& item)
+{
+  const uint8_t* body = static_cast<const uint8_t*>(item.getBodyPointer());
+  size_t size = item.getBodySize();
+  if (size < sizeof(uint32_t)) return "run ?";
+  uint32_t run;
+  memcpy(&run, body, sizeof run);
+  string result = "run " + to_string(run);
+  size_t titleOffset = 0;
+  if (size == sizeof(StateChangeItemBody))     titleOffset = offsetof(StateChangeItemBody, s_title);
+  if (size == sizeof(StateChangeItemBody) - 4) titleOffset = offsetof(StateChangeItemBody, s_title) - 4;
+  if (titleOffset) {
+    string title(reinterpret_cast<const char*>(body + titleOffset),
+                 strnlen(reinterpret_cast<const char*>(body + titleOffset), size - titleOffset));
+    if (!title.empty()) result += " \"" + title + "\"";
+  }
+  return result;
+}
+
 static bool
 number(const char* s, unsigned long& v)
 {
@@ -121,13 +148,14 @@ main(int argc, char** argv)
     {"dt",          required_argument, nullptr, 'd'},
     {"max-pending", required_argument, nullptr, 'p'},
     {"sourceid",    required_argument, nullptr, 's'},
+    {"timestamp",   required_argument, nullptr, 't'},
     {"outring",     required_argument, nullptr, 'o'},
     {"help",        no_argument,       nullptr, 'h'},
     {nullptr, 0, nullptr, 0}
   };
   int c;
   unsigned long v;
-  while ((c = getopt_long(argc, argv, "k:d:p:s:o:h", longopts, nullptr)) != -1) {
+  while ((c = getopt_long(argc, argv, "k:d:p:s:t:o:h", longopts, nullptr)) != -1) {
     switch (c) {
       case 'k':
         if (!strcmp(optarg, "time"))         config.key = EventBuilder::Key::Time;
@@ -145,6 +173,12 @@ main(int argc, char** argv)
       case 's':
         if (!number(optarg, v)) { errMsg("--sourceid must be a number"); return 2; }
         config.sourceId = v;
+        break;
+      case 't':
+        if (!strcmp(optarg, "first"))        config.timestamp = EventBuilder::Timestamp::First;
+        else if (!strcmp(optarg, "last"))    config.timestamp = EventBuilder::Timestamp::Last;
+        else if (!strcmp(optarg, "average")) config.timestamp = EventBuilder::Timestamp::Average;
+        else { errMsg("--timestamp must be first, last or average"); return 2; }
         break;
       case 'o': outring = optarg; break;
       case 'h': usage(cout); return 0;
@@ -199,10 +233,16 @@ main(int argc, char** argv)
       o << " by " << (config.key == EventBuilder::Key::Time
                       ? "timestamp, dt " + to_string(config.dt) : string("trigger_id"))
         << " into " << outring << " (source id " << config.sourceId
+        << ", timestamp " << (config.timestamp == EventBuilder::Timestamp::First ? "first"
+                              : config.timestamp == EventBuilder::Timestamp::Last ? "last" : "average")
         << ", max " << config.maxPending << " open)";
       logMsg(o.str());
     }
 
+    {
+      vector<uint8_t> format = EventBuilder::formatItem();
+      ring->put(format.data(), format.size());
+    }
     while (true) {
       unique_ptr<CRingItem> item(src->getItem());
       if (!item) break;                     // end of a file source
@@ -211,7 +251,8 @@ main(int argc, char** argv)
         ring->put(out.data(), out.size());
       }
       for (auto& msg : builder.takeMessages()) warnMsg(msg);
-      if (item->type() == END_RUN) logMsg("end of run: " + report(builder));
+      if (item->type() == BEGIN_RUN) logMsg("begin " + runOf(*item));
+      if (item->type() == END_RUN)   logMsg("end of " + runOf(*item) + ": " + report(builder));
     }
     for (auto& out : builder.flush()) ring->put(out.data(), out.size());
     logMsg("end of input: " + report(builder));

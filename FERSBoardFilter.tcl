@@ -51,6 +51,8 @@ namespace eval FERSBoardFilter {
     variable boardMask
     variable key
     variable dt
+    variable sourceId
+    variable timestamp
     source [file join $here FERSBoardFilterSettings.tcl]
 
     set ::DefaultActions::name FERSBoardFilter
@@ -123,6 +125,8 @@ namespace eval FERSBoardFilter {
         variable boardMask
         variable key
         variable dt
+        variable sourceId
+        variable timestamp
 
         if {$pipe eq {}} {
             set cmd [file join $here fersBoardFilter]
@@ -132,7 +136,7 @@ namespace eval FERSBoardFilter {
 
             freeProducer [outring]
 
-            set args "--key=$key --dt=$dt $inring $boardMask"
+            set args "--key=$key --dt=$dt --sourceid=$sourceId --timestamp=$timestamp $inring $boardMask"
             set pipe [open "| $cmd $args |& cat" r]
             chan configure $pipe -blocking 0 -buffering line
             chan event $pipe readable [list FERSBoardFilter::onReadable]

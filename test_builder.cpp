@@ -178,6 +178,7 @@ static EventBuilder::Config config(uint32_t boards, EventBuilder::Key key = Even
   c.activeBoards = boards;
   c.key = key;
   c.dt = 10000;
+  c.sourceId = 100;
   return c;
 }
 
@@ -209,30 +210,39 @@ int main(int argc, char** argv)
       out.insert(out.end(), outs.begin(), outs.end());
       if (i == 6) afterBoard0 = out.size();          // all of board 0 in, none of board 1
     }
-    CHECK(afterBoard0 == 2);                           // BEGIN_RUN and the header record only
+    CHECK(afterBoard0 == 3);                           // BEGIN_RUN, glom info and the header record only
     CHECK(eb.open() == 0);
-    CHECK(out.size() == 2 + 5 + 1);
-    if (out.size() == 8) {
-      CHECK(out[0] == stream[0]);                      // BEGIN_RUN unchanged
-      CHECK(out[7] == stream.back());                  // END_RUN unchanged
-      // the header record: a built event of one fragment, source id kept
-      auto hf = fragments(out[1]);
+    CHECK(out.size() == 3 + 5 + 1);
+    if (out.size() == 9) {
+      // BEGIN/END_RUN pass with the filter's source id, otherwise unchanged
+      CHECK(sameButSid(out[0], stream[0]) && get<uint32_t>(out[0], SID) == 100);
+      CHECK(sameButSid(out[8], stream.back()) && get<uint32_t>(out[8], SID) == 100);
+      // after BEGIN_RUN the glom parameters: dt ticks, building, latest (the default)
+      CHECK(out[1].size() == sizeof(GlomParameters));
+      if (out[1].size() == sizeof(GlomParameters)) {
+        GlomParameters g; memcpy(&g, out[1].data(), sizeof g);
+        CHECK(g.s_header.s_size == sizeof g && g.s_header.s_type == EVB_GLOM_INFO);
+        CHECK(g.s_empty == sizeof(uint32_t) && g.s_coincidenceTicks == eb.config().dt);
+        CHECK(g.s_isBuilding == 1 && g.s_timestampPolicy == GLOM_TIMESTAMP_LAST);
+      }
+      // the header record: a built event of one fragment, payload source id kept
+      auto hf = fragments(out[2]);
       CHECK(hf.size() == 1);
       if (hf.size() == 1) {
         CHECK(hf[0].item == stream[1]);
         CHECK(hf[0].sid == 7 && hf[0].ts == 0 && hf[0].barrier == 0);
       }
-      CHECK(get<uint64_t>(out[1], TS) == 0);
-      CHECK(get<uint32_t>(out[1], SID) == 100);
+      CHECK(get<uint64_t>(out[2], TS) == 0);
+      CHECK(get<uint32_t>(out[2], SID) == 100);
       CHECK(eb.dataFormat() == 34);
       for (int t = 0; t < 5; t++) {
-        const Bytes& e = out[2 + t];
+        const Bytes& e = out[3 + t];
         auto f = fragments(e);
         CHECK(f.size() == 2);
         if (f.size() != 2) continue;
         checkFragment(f[0], items[0][t][0], 0);                 // earlier stamp first, although
         checkFragment(f[1], items[1][t][0], 1);                 // (bunched) board 1's came later
-        CHECK(get<uint64_t>(e, TS) == stamp(Ev{0x01, false, false, 1, 0, 1000.0*t, 0, 2}));  // earliest
+        CHECK(get<uint64_t>(e, TS) == stamp(Ev{0x01, false, false, 1, 1, 1000.0*t + 0.01, 0, 2}));  // latest: board 1's
         CHECK(get<uint32_t>(e, SID) == 100);
       }
     }
@@ -244,6 +254,14 @@ int main(int argc, char** argv)
     auto msgs = eb.takeMessages();
     CHECK(msgs.size() == 1 && msgs[0].find("ignoring board 2") != string::npos);
     CHECK(eb.takeMessages().empty());
+
+    // the counts start over with the next run
+    size_t n = 0;
+    for (auto& item : stream) n += eb.process(item.data(), item.size()).size();
+    CHECK(n == 9);                                    // the glom info again
+    CHECK(s.built == 5 && s.perBoard[0] == 5 && s.perBoard[1] == 5);
+    CHECK(s.headerRecords == 1 && s.passed == 2 && s.maskedDropped == 5);
+    CHECK(eb.takeMessages().empty());                  // still said once per process
   }
 
   // --- a trigger a board missed is released once that board has gone past it
@@ -288,7 +306,8 @@ int main(int argc, char** argv)
     eb.process(item.data(), item.size());
     Bytes end = stateItem(END_RUN, true);
     auto outs = eb.process(end.data(), end.size());
-    CHECK(outs.size() == 2 && outs[1] == end && eb.open() == 0);
+    CHECK(outs.size() == 2 && eb.open() == 0);
+    CHECK(outs.size() == 2 && sameButSid(outs[1], end) && get<uint32_t>(outs[1], SID) == 100);
   }
 
   // --- the window: within dt joins (even earlier than the first), beyond opens a new trigger
@@ -306,7 +325,7 @@ int main(int argc, char** argv)
     if (outs.size() == 1) {
       auto f = fragments(outs[0]);
       CHECK(f.size() == 2);
-      CHECK(get<uint64_t>(outs[0], TS) == get<uint64_t>(earlier, TS));   // earliest fragment
+      CHECK(get<uint64_t>(outs[0], TS) == get<uint64_t>(first, TS));     // latest fragment
     }
     CHECK(eb.process(beyond.data(), beyond.size()).empty());
     outs = eb.process(beyond1.data(), beyond1.size());
@@ -395,13 +414,13 @@ int main(int argc, char** argv)
     }
   }
 
-  // --- items without a body header: state changes pass as they are,
-  //     events are dropped (Janus always writes one)
+  // --- items without a body header: state changes pass as they are (no
+  //     source id to set), events are dropped (Janus always writes one)
   {
     EventBuilder eb(config(0x1));
     Bytes begin = stateItem(BEGIN_RUN, false);
     auto outs = eb.process(begin.data(), begin.size());
-    CHECK(outs.size() == 1 && outs[0] == begin);
+    CHECK(outs.size() == 2 && outs[0] == begin);       // then the glom info
     Bytes bare = bareItem(PHYSICS_EVENT, Bytes(eventItem(Ev()).begin() + BODY, eventItem(Ev()).end()));
     CHECK(eb.process(bare.data(), bare.size()).empty());
     CHECK(eb.stats().badDropped == 1 && eb.stats().passed == 1);
@@ -456,6 +475,46 @@ int main(int argc, char** argv)
   }
 
   if (failures) { cerr << failures << " check(s) failed" << endl; return 1; }
+  // --- the timestamp policy: first, last, average of the fragments'
+  {
+    struct { EventBuilder::Timestamp policy; double us; uint16_t glom; } cases[] = {
+      {EventBuilder::Timestamp::First,   10.0, GLOM_TIMESTAMP_FIRST},
+      {EventBuilder::Timestamp::Last,    10.4, GLOM_TIMESTAMP_LAST},
+      {EventBuilder::Timestamp::Average, 10.2, GLOM_TIMESTAMP_AVERAGE},
+    };
+    for (auto& c : cases) {
+      EventBuilder::Config cfg = config(0x3);
+      cfg.timestamp = c.policy;
+      EventBuilder eb(cfg);
+      Bytes begin = stateItem(BEGIN_RUN, true);
+      auto outs = eb.process(begin.data(), begin.size());
+      CHECK(outs.size() == 2);
+      if (outs.size() == 2) {
+        GlomParameters g; memcpy(&g, outs[1].data(), sizeof g);
+        CHECK(g.s_timestampPolicy == c.glom);
+      }
+      Ev e; e.board = 1; e.tstamp_us = 10.4; Bytes late = eventItem(e);
+      e.board = 0; e.tstamp_us = 10.0;       Bytes early = eventItem(e);
+      eb.process(late.data(), late.size());
+      outs = eb.process(early.data(), early.size());
+      CHECK(outs.size() == 1);
+      Ev want; want.tstamp_us = c.us;
+      if (outs.size() == 1) CHECK(get<uint64_t>(outs[0], TS) == stamp(want));
+    }
+  }
+
+  // --- the RING_FORMAT item a stream starts with
+  {
+    Bytes f = EventBuilder::formatItem();
+    CHECK(f.size() == sizeof(DataFormat));
+    if (f.size() == sizeof(DataFormat)) {
+      DataFormat d; memcpy(&d, f.data(), sizeof d);
+      CHECK(d.s_header.s_size == sizeof d && d.s_header.s_type == RING_FORMAT);
+      CHECK(d.s_empty == sizeof(uint32_t));
+      CHECK(d.s_majorVersion == FORMAT_MAJOR && d.s_minorVersion == FORMAT_MINOR);
+    }
+  }
+
   cout << "test_builder: all checks passed" << endl;
   return 0;
 }

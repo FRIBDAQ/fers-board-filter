@@ -20,9 +20,13 @@ rather than trigger by trigger.  `fersBoardFilter` reads that ring and
 * writes it as one built `PHYSICS_EVENT` in the layout glom writes (below),
   one fragment per board item with the fragment and body-header source id set
   to the board number, fragments in timestamp order;
-* passes BEGIN/END_RUN (and any other non-event item) through unchanged after
-  releasing the open triggers, and writes the Janus file-header record (once
-  per run) as a built event with that one fragment;
+* passes BEGIN/END_RUN (and any other non-event item) through after releasing
+  the open triggers, with the body-header source id set to its own, and
+  writes the Janus file-header record (once per run) as a built event with
+  that one fragment;
+* starts its output with a `RING_FORMAT` item and follows every BEGIN_RUN
+  with an `EVB_GLOM_INFO` item (window `dt`, timestamp policy), as glom
+  does, so the stream looks like the event builder's to its consumers;
 * creates the output ring `<inring>_event` – and a local input ring – when
   they do not exist, so it can be started before Janus;
 * drops events of boards that are not in the mask (one notice per board) and
@@ -42,7 +46,7 @@ differ, which is arbitrary in the orderer too.
 | `fersBoardFilter.cpp`, `EventBuilder.{h,cpp}` | the filter program |
 | `test_builder.cpp` | unit tests of the building (`make test`) |
 | `FERSBoardFilter.tcl`, `pkgIndex.tcl` | ReadoutShell package that runs the filter |
-| `FERSBoardFilterSettings.tcl` | ring name, board mask, key, window |
+| `FERSBoardFilterSettings.tcl` | ring name, board mask, key, window, source id, timestamp policy |
 | `ReadoutCallouts.tcl` | runs the filter from ReadoutShell |
 
 ## Build
@@ -61,7 +65,7 @@ Start the filter from an environment where `daqsetup.bash` was sourced
 
 1. Edit `FERSBoardFilterSettings.tcl`: `inring` (the ring Janus writes to,
    "Output RingBuffer" of the Janus provider), `boardMask` (bit *b* set =
-   board *b*), `key` and `dt` (see below).
+   board *b*), `key`, `dt`, `sourceId` and `timestamp` (see below).
 2. Point ReadoutShell at `ReadoutCallouts.tcl` (or merge its three lines into
    yours).  The event logger and SpecTcl read `<inring>_event`.
 
@@ -71,16 +75,18 @@ launcher: when a run starts (Halted → Active) and the filter is not running it
 
 * frees the producer slot of the output ring if an earlier session left one
   (kills the process when it still runs, releases the slot when it is dead),
-* starts `fersBoardFilter --key=<key> --dt=<dt> <inring> <boardMask>` from
+* starts `fersBoardFilter --key=<key> --dt=<dt> --sourceid=<sourceId>
+  --timestamp=<timestamp>
+  <inring> <boardMask>` from
   this directory with its output piped through an `Actions` parser, so the
   filter's messages appear in the ReadoutGUI log with their severity
   (the filter writes `LOGMSG`/`WRNMSG`/`ERRMSG <length> <text>` packets),
 * waits (up to 5 s) until the filter is the producer of `<inring>_event`; a
   filter that exited or could not attach makes the run start fail.
 
-The filter keeps running between runs and reports the counts at every
-END_RUN; if it exits, the log says with which status or signal, and it is
-started again at the next run start.
+The filter keeps running between runs and reports the run's counts at every
+END_RUN (they start over at BEGIN_RUN); if it exits, the log says with which
+status or signal, and it is started again at the next run start.
 
 ## Running by hand
 
@@ -106,7 +112,12 @@ started again at the next run start.
   100.  Boards of one trigger were within 3 units in `janus.evt`.
 * `--max-pending=N` – open triggers before the oldest is released although a
   board has not gone past it (default 1000; about 450 bytes per board item).
-* `--sourceid=N` – body-header source id of the built events (default 100).
+* `--sourceid=N` – body-header source id of everything the filter writes:
+  built events, the header-record event and the passed-through state
+  changes (default 10).
+* `--timestamp=first|last|average` – body-header timestamp of a built event:
+  the earliest, the latest or the average of its fragments' (default last,
+  glom's `--timestamp-policy`).
 
 Example, Janus writing to ring `janus`, boards 0 to 5:
 
@@ -124,16 +135,25 @@ A built event, as glom writes it (`unpackBuiltEvent` in SpecTcl-Janus walks
 the same):
 
     RingItemHeader {size, PHYSICS_EVENT}
-    BodyHeader {20, timestamp = earliest fragment's, --sourceid, barrier 0}
+    BodyHeader {20, timestamp per --timestamp (default: latest fragment's),
+                --sourceid, barrier 0}
     uint32 body bytes (itself included)
     fragments: uint64 timestamp | uint32 sourceId = board | uint32 bytes
                | uint32 barrier 0 | the board's ring item (body-header
                source id = board, otherwise byte-identical)
 
 The header-record event has one fragment whose source id is the one Janus
-gave the record.  State changes are the items Janus wrote, unchanged (one
-BEGIN_RUN and one END_RUN per run, not one per board as the event builder
-emits), and there is no `EVB_GLOM_INFO` item.
+gave the record.  State changes are the items Janus wrote with the
+body-header source id replaced by `--sourceid` (one BEGIN_RUN and one
+END_RUN per run, not one per board as the event builder emits).  So the body
+header of every item the filter writes carries `--sourceid`; only the
+fragments inside built events keep their own ids (the board number, or
+Janus's for the header record).
+
+The stream starts with a `RING_FORMAT` item (NSCLDAQ `FORMAT_MAJOR.MINOR`,
+no body header) and every BEGIN_RUN is followed by an `EVB_GLOM_INFO` item
+`{coincidenceTicks = dt (0 for --key=trigger), isBuilding 1, timestampPolicy
+= --timestamp}`; glom writes the same two items, the second once per process.
 
 ## Data layout the filter relies on
 

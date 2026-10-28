@@ -33,7 +33,7 @@
 // consumers of built events (SpecTcl-Janus unpackBuiltEvent, unglom) read
 // it unchanged:
 //
-//   ring item header | body header (earliest fragment timestamp, sourceId,
+//   ring item header | body header (timestamp per Config::timestamp, sourceId,
 //   barrier 0) | uint32 body bytes (itself included) | fragments
 //   fragment = uint64 timestamp | uint32 sourceId (board) | uint32 bytes
 //              | uint32 barrier (0) | the board's ring item, byte-identical
@@ -48,9 +48,14 @@
 // fragments go out in timestamp order, as the event builder's orderer
 // would have delivered them to glom.
 //
-// BEGIN/END_RUN and any other non-event item pass through unchanged after
-// the open triggers are released.  The Janus file-header record, written
-// once per run, becomes a built event of its own with one fragment.
+// BEGIN/END_RUN and any other non-event item pass through after the open
+// triggers are released, with the body-header source id set to sourceId
+// like everything else the builder writes.  Every BEGIN_RUN is followed by
+// an EVB_GLOM_INFO item describing the building (dt, timestamp policy), as
+// glom writes one; formatItem() gives the RING_FORMAT item
+// a stream starts with.  The Janus file-header record, written once per
+// run, becomes a built event of its own with one fragment that keeps
+// Janus's source id.
 //
 // Works on raw ring item bytes (DataFormat.h) so it can be tested without
 // the NSCLDAQ libraries.
@@ -74,15 +79,21 @@ class EventBuilder
     // events carry no trigger_id and always use Time.
     enum class Key { Trigger, Time };
 
+    // Body-header timestamp of a built event: the earliest, the latest or
+    // the average of its fragments' (glom's --timestamp-policy)
+    enum class Timestamp { First, Last, Average };
+
     struct Config {
       uint32_t activeBoards = 0x1;  // bit b set -> board b is built (inverse of
                                     // the SpecTcl boardMask)
       Key      key          = Key::Time;
       uint64_t dt           = 100;    // Time window, body-header timestamp units
       size_t   maxPending   = 1000;   // open triggers before the oldest is forced
-      uint32_t sourceId     = 100;    // body-header source id of built events
+      uint32_t sourceId     = 10;     // body-header source id of all output items
+      Timestamp timestamp   = Timestamp::Last;
     };
 
+    // Counts since the last BEGIN_RUN (the whole input when there was none)
     struct Stats {
       uint64_t perBoard[kMaxBoards] = {};  // fragments built per board
       uint64_t built = 0;                  // built events (header records excluded)
@@ -107,6 +118,10 @@ class EventBuilder
     // Releases every open trigger (end of input).
     Items flush();
 
+    // The RING_FORMAT item (FORMAT_MAJOR.FORMAT_MINOR of DataFormat.h) to
+    // write before anything else, as glom does when it starts.
+    static std::vector<uint8_t> formatItem();
+
     const Stats& stats() const { return m_stats; }
     const Config& config() const { return m_config; }
     size_t open() const { return m_open.size(); }
@@ -126,7 +141,6 @@ class EventBuilder
     };
     struct Group {
       uint64_t              key = 0;
-      uint64_t              firstTs = UINT64_MAX; // earliest fragment timestamp
       uint32_t              boards = 0;           // bit per contributing board
       std::vector<Fragment> frags;
     };
@@ -134,6 +148,7 @@ class EventBuilder
     void addFragment(Group& g, const uint8_t* p, size_t n, const View& v,
                      uint32_t sourceId, uint64_t timestamp);
     std::vector<uint8_t> finish(Group& g);
+    std::vector<uint8_t> glomItem() const;
     void release(Items& out, bool all);
     void releaseAll(Items& out);
     bool complete(const Group& g) const;
